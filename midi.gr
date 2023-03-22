@@ -1,0 +1,344 @@
+module MidiParser
+
+include "./Stream"
+include "list"
+include "uint32"
+include "uint16"
+include "array"
+include "string"
+
+provide enum Note {
+  C,
+  CSharp,
+  D,
+  DSharp,
+  E,
+  ESharp,
+  F,
+  FSharp,
+  G,
+  GSharp,
+  A,
+  ASharp,
+  B,
+}
+provide enum MidiFormat {
+  SingleTrack,
+  MultiTrack,
+  MultiSong,
+}
+provide enum TrackEvent {
+  // MetaEvent
+  MetaSequenceNumber(Number),
+  MetaTextEvent(String),
+  MetaCopyRightEvent(String),
+  MetaTrackNameEvent(String),
+  MetaInstrNameEvent(String),
+  MetaLyricEvent(String),
+  MetaMarkerEvent(String),
+  MetaCueEvent(String),
+  MetaChannelPrefixEvent(Number),
+  MetaEndOfTrackEvent,
+  MetaSetTempoEvent(Number),
+  MetaSMPTEOffsetEvent(Number, Number, Number, Number, Number, Number),
+  MetaTimeSignatureEvent(Number, Number, Number, Number),
+  MetaKeySignatureEvent(Number, Number),
+  MetaDataSequenceEvent(Bytes),
+  // SystemEvent
+  SysExclusiveEvent(Bytes),
+  SysSongSelectEvent(Number),
+  SysTuneRequestEvent,
+  SysTimingClockEvent,
+  SysStartEvent,
+  SysContinueEvent,
+  SysStopEvent,
+  SysActiveSensingEvent,
+  SysResetEvent,
+  // MidiEvent
+  MidiNoteOffEvent(Number, Number, Number),
+  MidiNoteOnEvent(Number, Number, Number),
+  MidiKeyPressureEvent(Number, Number, Number),
+  MidiControlChangeEvent(Number, Number, Number),
+  MidiProgramChangeEvent(Number, Number),
+  MidiChannelPressureEvent(Number, Number),
+  MidiPitchWheelEvent(Number, Number),
+}
+provide enum MidiChunk {
+  HeaderChunk(
+    MidiFormat,
+    Number,
+    Option<Number>,
+    Number
+  ), // Format, fps, numTracks, Division
+  TrackChunk(List<(Number, TrackEvent)>),
+}
+provide record MidiFile {
+  midiFormat: MidiFormat,
+  numTracks: Number,
+  timeDivision: Number,
+  framePerSecond: Option<Number>,
+  tracks: List<List<(Number, TrackEvent)>>,
+}
+// Parsers
+let parseMetaEvent = midiData => {
+  let eventType = Stream.nextByte(midiData)
+  let eventLen = Stream.getVlb(midiData)
+  match (eventType) {
+    0x00 => {
+      if (eventLen != 2) {
+        Err("Expected length for sequenceNumber event is 2")
+      } else {
+        let sequenceNumber = Uint16.toNumber(
+          Stream.getNextUint16(midiData, useBigEndian=true)
+        )
+        Ok(MetaSequenceNumber(sequenceNumber))
+      }
+    },
+    0x01 => Ok(MetaTextEvent(Stream.nextSliceString(midiData, eventLen))),
+    0x02 => Ok(MetaCopyRightEvent(Stream.nextSliceString(midiData, eventLen))),
+    0x03 => Ok(MetaTrackNameEvent(Stream.nextSliceString(midiData, eventLen))),
+    0x04 => Ok(MetaInstrNameEvent(Stream.nextSliceString(midiData, eventLen))),
+    0x05 => Ok(MetaLyricEvent(Stream.nextSliceString(midiData, eventLen))),
+    0x06 => Ok(MetaMarkerEvent(Stream.nextSliceString(midiData, eventLen))),
+    0x07 => Ok(MetaCueEvent(Stream.nextSliceString(midiData, eventLen))),
+    0x20 => Ok(MetaChannelPrefixEvent(Stream.nextByte(midiData))),
+    0x2F => Ok(MetaEndOfTrackEvent),
+    0x51 => {
+      let byteOne = Stream.nextByte(midiData)
+      let byteTwo = Stream.nextByte(midiData)
+      let byteThree = Stream.nextByte(midiData)
+      let tempo = byteOne + (byteTwo << 8) + (byteThree << 16)
+      Ok(MetaSetTempoEvent(tempo))
+    },
+    0x54 => {
+      let hrByte = Stream.nextByte(midiData)
+      let frameRate = match (hrByte & 0x60) {
+        0x00 => Ok(24),
+        0x20 => Ok(25),
+        0x40 => Ok(29),
+        0x60 => Ok(30),
+        _ => Err("Invalid SMPTE Offset"),
+      }
+      match (frameRate) {
+        Ok(frameRate) => {
+          let hr = hrByte & 0x1f
+          let mn = Stream.nextByte(midiData)
+          let se = Stream.nextByte(midiData)
+          let frame = Stream.nextByte(midiData)
+          let subFrame = Stream.nextByte(midiData)
+          Ok(MetaSMPTEOffsetEvent(frameRate, hr, mn, se, frame, subFrame))
+        },
+        Err(err) => Err(err),
+      }
+    },
+    0x58 => {
+      let numerator = Stream.nextByte(midiData)
+      let denominator = 1 << Stream.nextByte(midiData)
+      let metronome = Stream.nextByte(midiData)
+      let thirtySeconds = Stream.nextByte(midiData)
+      Ok(
+        MetaTimeSignatureEvent(numerator, denominator, metronome, thirtySeconds)
+      )
+    },
+    0x59 => {
+      let key = Stream.nextByte(midiData)
+      let scale = Stream.nextByte(midiData)
+      Ok(MetaKeySignatureEvent(key, scale))
+    },
+    0x7f => {
+      let data = Stream.nextSliceBytes(midiData, eventLen)
+      Ok(MetaDataSequenceEvent(data))
+    },
+    _ => Err("Invalid Meta Event"),
+  }
+}
+let parseSystemEvent = (nextByte, midiData) => {
+  let eventType = nextByte >> 4
+  let channelNum = nextByte & 0x0F
+  match (eventType) {
+    // Channel Voice Messages
+    // TODO: Implement These Two Events, consume an sysEnd
+    0xF0 => Err("Not Implemented System Exclusive Event"),
+    0xF2 => Err("Not Implemented System Song Position Pointer Event"),
+    0xF3 => {
+      let selection = Stream.nextByte(midiData)
+      Ok(SysSongSelectEvent(selection))
+    },
+    0xF6 => Ok(SysTuneRequestEvent),
+    0xF7 => Err("Invalid System Exclusive Event Without Start"),
+    0xF8 => Ok(SysTimingClockEvent),
+    0xFA => Ok(SysStartEvent),
+    0xFB => Ok(SysContinueEvent),
+    0xFC => Ok(SysStopEvent),
+    0xFE => Ok(SysActiveSensingEvent),
+    0xFF => Ok(SysResetEvent),
+    // Channel Control Messages
+    _ => Err("Not Implemented System Event"),
+  }
+}
+let parseMidiEvent = (nextByte, midiData) => {
+  let eventType = nextByte >> 4
+  let channelNum = nextByte & 0x0F
+  match (eventType) {
+    // Channel Voice Messages
+    0x08 => {
+      let noteNum = Stream.nextByte(midiData)
+      let velocity = Stream.nextByte(midiData)
+      Ok(MidiNoteOffEvent(channelNum, noteNum, velocity))
+    },
+    0x09 => {
+      let noteNum = Stream.nextByte(midiData)
+      let velocity = Stream.nextByte(midiData)
+      Ok(MidiNoteOnEvent(channelNum, noteNum, velocity))
+    },
+    0x0A => {
+      let noteNum = Stream.nextByte(midiData)
+      let pressure = Stream.nextByte(midiData)
+      Ok(MidiKeyPressureEvent(channelNum, noteNum, pressure))
+    },
+    0x0B => {
+      let controllerNum = Stream.nextByte(midiData)
+      let newValue = Stream.nextByte(midiData)
+      Ok(MidiControlChangeEvent(channelNum, controllerNum, newValue))
+    },
+    0x0C => {
+      let programNum = Stream.nextByte(midiData)
+      Ok(MidiProgramChangeEvent(channelNum, programNum))
+    },
+    0x0D => {
+      let pressure = Stream.nextByte(midiData)
+      Ok(MidiChannelPressureEvent(channelNum, pressure))
+    },
+    0x0E => {
+      let leastSignificantBits = Stream.nextByte(midiData)
+      let pitchWheelValue = leastSignificantBits +
+        (Stream.nextByte(midiData) << 7) -
+        0x2000
+      Ok(MidiPitchWheelEvent(channelNum, pitchWheelValue))
+    },
+    // Channel Control Messages
+    _ => Err("Not Implemented Midi Event"),
+  }
+}
+let parseTrackEvent = midiData => {
+  let nextByte = Stream.nextByte(midiData)
+  // Parse The Event
+  if ((nextByte & 0x80) == 0) {
+    Err("Invalid Track Event")
+  } else {
+    match (nextByte) {
+      0xFF => parseMetaEvent(midiData),
+      0xf0 => parseSystemEvent(nextByte, midiData),
+      _ when nextByte < 0xF0 => parseMidiEvent(nextByte, midiData),
+      _ => Err("Invalid Track Event"),
+    }
+  }
+}
+let parseChunk = midiData => {
+  let headerLabel = Stream.nextSliceList(midiData, 4)
+  let chunkLength = Stream.getNextUint32(midiData, useBigEndian=true)
+  let output = match (headerLabel) {
+    [0x4D, 0x54, 0x68, 0x64] => {
+      from Uint16 use { (&), (-), (>>>) }
+      if (chunkLength != 0x06ul) return Err("Invalid Header Chunk")
+      // MThd Chunk
+      let midiFormat = Stream.getNextUint16(midiData, useBigEndian=true)
+      let midiTrackCount = Stream.getNextUint16(midiData, useBigEndian=true)
+      let midiTimeDivision = Stream.getNextUint16(midiData, useBigEndian=true)
+      let (midiTimeDivision, framesPerSecond) = if (
+        (midiTimeDivision & 0x8000uS) == 0uS
+      ) {
+        let framesPerSecond = 0x100uS - (midiTimeDivision >>> 8uS)
+        (midiTimeDivision & 0xFFuS, Some(Uint16.toNumber(framesPerSecond)))
+      } else {
+        (midiTimeDivision, None)
+      }
+      // Parsing
+      let midiFormat = match (midiFormat) {
+        0x00uS => SingleTrack,
+        0x01uS => MultiTrack,
+        0x02uS => MultiSong,
+        _ => fail return Err("Invalid Midi Format"),
+      }
+      if (midiTrackCount == 0x00uS && midiTrackCount != 1uS)
+        return Err("Invalid Track Count")
+      HeaderChunk(
+        midiFormat,
+        Uint16.toNumber(midiTrackCount),
+        framesPerSecond,
+        Uint16.toNumber(midiTimeDivision)
+      )
+    },
+    [0x4D, 0x54, 0x72, 0x6B] => {
+      // MTrk Chunk
+      let mut trackData = Stream.nextStreamSlice(
+        midiData,
+        Uint32.toNumber(chunkLength)
+      )
+      let mut trackEvents = []
+      while (Stream.remainingLength(trackData) > 0) {
+        // Parse The Track Events
+        let deltaTime = Stream.getVlb(trackData)
+        let trackEvent = parseTrackEvent(trackData)
+        match (trackEvent) {
+          Ok(trackEvent) =>
+            trackEvents = [(deltaTime, trackEvent), ...trackEvents],
+          Err(err) => return Err(err),
+        }
+      }
+      TrackChunk(List.reverse(trackEvents))
+    },
+    _ => fail "Invalid Chunk Header",
+  }
+  return Ok(output)
+}
+provide let getNote = noteNum => {
+  let octave = noteNum % 12
+  let noteValue = (noteNum - octave) / 12
+  (octave - 1, noteValue)
+}
+provide let parseMidi = midiData => {
+  let midiStream = Stream.fromBytes(midiData)
+  let headerChunk = parseChunk(midiStream)
+  return match (headerChunk) {
+    Ok(
+      HeaderChunk(
+        midiFormat,
+        numTracks,
+        framePerSecond,
+        midiTimeDivision
+      )
+    ) => {
+      // Parse Tracks
+      let trackStorage = Array.make(numTracks, None)
+      for (let mut i = 0; i < numTracks; i += 1) {
+        let track = parseChunk(midiStream)
+        match (track) {
+          Ok(TrackChunk(trackEvents)) =>
+            Array.set(i, Some(trackEvents), trackStorage),
+          Ok(_) =>
+            return Err("Midi File May Only Contain A Single Header Chunk"),
+          Err(err) => return Err(err),
+        }
+      }
+      let track = Array.map(track => {
+        match (track) {
+          Some(track) => track,
+          None => fail "Impossible",
+        }
+      }, trackStorage)
+      // Return Our Track Data
+      Ok(
+        {
+          midiFormat,
+          numTracks,
+          timeDivision: midiTimeDivision,
+          framePerSecond,
+          tracks: Array.toList(track),
+        }
+      )
+    },
+    Ok(_) => Err("Midi File Must Start With Header Chunk"),
+    _ => Err("Invalid Header Chunk "),
+  }
+}
