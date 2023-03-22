@@ -1,0 +1,92 @@
+module Stream
+
+// Imports
+include "runtime/unsafe/wasmi32"
+include "runtime/numbers"
+include "uint32"
+include "uint16"
+include "bytes"
+include "list"
+from Numbers use { coerceNumberToWasmI32 }
+// Helpers
+@unsafe
+let tagSimple = x => WasmI32.xor(WasmI32.shl(x, 1n), 1n)
+// Library For Interacting With Streams Of Data
+provide record Stream {
+  data: Bytes,
+  mut position: Number,
+}
+// Functions
+provide let empty = () => {
+  { data: Bytes.empty, position: 0 }
+}
+provide let fromBytes = data => {
+  // Create A New Stream
+  { data, position: 0 }
+}
+// Get The Next Element
+@unsafe
+provide let nextByte = stream => {
+  // Get The Value
+  let ptr = WasmI32.fromGrain(stream.data)
+  let bytesOffset = WasmI32.add(ptr, 8n)
+  let byte = WasmI32.load8U(bytesOffset, coerceNumberToWasmI32(stream.position))
+  stream.position += 1
+  // Return The Value
+  WasmI32.toGrain(tagSimple(byte)): Number
+}
+// Length
+provide let length = stream => Bytes.length(stream.data)
+provide let remainingLength = stream => length(stream) - stream.position
+// Get The Next Slice
+provide let nextSliceBytes = (stream, length) => {
+  let result = Bytes.slice(stream.position, length, stream.data)
+  stream.position += length
+  result
+}
+provide let nextStreamSlice = (stream, length) => {
+  let result = nextSliceBytes(stream, length)
+  fromBytes(result)
+}
+provide let nextSliceList = (stream, length) => {
+  List.init(length, index => nextByte(stream))
+}
+provide let nextSliceString = (stream, length) => {
+  Bytes.toString(nextSliceBytes(stream, length))
+}
+// Get Numbers
+// TODO(grain-issue #1774): Use built in function
+provide let getNextUint32 = (stream, useBigEndian=false) => {
+  from Uint32 use { (<<), (>>>), (&), (|) }
+  let result = Bytes.getUint32(stream.position, stream.data)
+  stream.position += 4
+  if (useBigEndian) {
+    result >>> 24ul & 0xfful | // move byte 3 to byte 0
+      result << 8ul & 0xff0000ul | // move byte 1 to byte 2
+      result >>> 8ul & 0xff00ul | // move byte 2 to byte 1
+      result << 24ul & 0xff000000ul // byte 0 to byte 3
+  } else {
+    result
+  }
+}
+// TODO(grain-issue #1774): Use built in function
+provide let getNextUint16 = (stream, useBigEndian=false) => {
+  from Uint16 use { (<<), (>>>), (|) }
+  let result = Bytes.getUint16(stream.position, stream.data)
+  stream.position += 2
+  if (useBigEndian) result >>> 8uS | result << 8uS else result
+}
+provide let getVlb = stream => {
+  let mut count = 0
+  let mut result = 0
+  while (true) {
+    let byte = nextByte(stream)
+    count += 1
+    if (count == 3 || byte <= 0) {
+      return 0
+    }
+    result = (result << 7) + (byte & 0x7F)
+    if ((byte & 0x80) == 0) break
+  }
+  return result
+}
